@@ -380,5 +380,20 @@ fun Application.verifierModule() {
                 )
             )
         }
+
+        get("/verify-ui") {
+            val ar = mapOf(
+                "client_id" to "http://localhost:9080/callback",
+                "response_type" to "vp_token",
+                "nonce" to UUID.randomUUID().toString(),
+                "state" to UUID.randomUUID().toString(),
+                "presentation_definition_uri" to "http://localhost:9080/pd/university-id"
+            )
+            val uri = "openid-vc://?" + ar.entries.joinToString("&") { "${it.key}=${it.value}" }
+            call.respondText(
+                "<html><body><h3>Scan to present your credential</h3><pre>$uri</pre></body></html>",
+                ContentType.Text.Html
+            )
+        }
     }
 }
