@@ -11,8 +11,10 @@ import com.networknt.schema.JsonSchemaFactory
 import com.networknt.schema.SpecVersion
 import com.networknt.schema.ValidationMessage
 import com.nimbusds.jose.*
+import com.nimbusds.jose.crypto.MACSigner
 import com.nimbusds.jose.crypto.RSASSAVerifier
 import com.nimbusds.jose.jwk.*
+import com.nimbusds.jwt.JWTClaimsSet
 import com.nimbusds.jwt.SignedJWT
 import io.ktor.client.*
 import io.ktor.client.engine.java.Java
@@ -24,6 +26,20 @@ import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import java.time.Instant
 import java.util.*
+
+
+data class AuthzReq(
+    val client_id: String,
+    val response_type: String = "vp_token",
+    val response_mode: String = "query", // or "post"
+    val redirect_uri: String,
+    val nonce: String,
+    val state: String,
+    val presentation_definition_uri: String // or inline "presentation_definition"
+)
+
+val requestStore = mutableMapOf<String, String>() // state -> nonce
+val issuerAllowlist = setOf("https://issuer.example.com/issuer") // tighten for your trust model
 
 val universityIdSubjectSchema = """
 {
@@ -81,6 +97,9 @@ fun main() {
 }
 
 fun Application.verifierModule() {
+    val base = "https://verifier.example.com"
+    val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+
     install(ContentNegotiation) {
         jackson { registerKotlinModule() }
     }
@@ -88,6 +107,31 @@ fun Application.verifierModule() {
     val jwksCache = JwksCache(http)
 
     routing {
+
+        get("/vp-token") {
+            val nonce = call.request.queryParameters["nonce"] //temp
+            val vc = call.request.queryParameters["vc"]//temp
+            val now = Instant.now()
+            val claims = JWTClaimsSet.Builder()
+                .issuer("did:example:holder")
+                .audience("https://verifier.example.com/callback")
+                .claim("nonce", nonce)
+                .claim("vp", mapOf(
+                    "@context" to listOf("https://www.w3.org/2018/credentials/v1"),
+                    "type" to listOf("VerifiablePresentation"),
+                    "verifiableCredential" to listOf(vc)
+                ))
+                .issueTime(Date.from(now))
+                .expirationTime(Date.from(now.plusSeconds(600)))
+                .jwtID(UUID.randomUUID().toString())
+                .build()
+
+            // Use HS256 with a throwaway secret (verifier isn’t checking VP signature)
+            val header = JWSHeader.Builder(JWSAlgorithm.HS256).type(JOSEObjectType.JWT).build()
+            val jwt = SignedJWT(header, claims)
+            jwt.sign(MACSigner("01234567890123456789012345678901")) // 32-byte secret
+            call.respond(jwt.serialize())
+        }
         // POST /verify { "credential": "<jwt-vc>" }
         post("/verify") {
             val req = runCatching { call.receive<VerifyRequest>() }.getOrElse {
@@ -166,12 +210,175 @@ fun Application.verifierModule() {
             )
         }
 
-        // (Optional) SKETCH: OID4VP authz req builder (QR/deeplink your wallets understand)
-        // For a real flow you'd generate a request object (Pushed Authorization Request or URI),
-        // include a Presentation Definition (DIF) describing UniversityID requirement, and accept vp_token at your redirect_uri.
+        // 1) Serve the Presentation Definition
+        get("/pd/university-id") {
+            val pd = mapOf(
+                "id" to "pd-university-id",
+                "input_descriptors" to listOf(
+                    mapOf(
+                        "id" to "university-id",
+                        "name" to "University ID",
+                        "constraints" to mapOf(
+                            "fields" to listOf(
+                                mapOf("path" to listOf("$.vc.type[*]"), "filter" to mapOf("type" to "string", "const" to "UniversityID")),
+                                mapOf("path" to listOf("$.vc.credentialSubject.studentId"), "filter" to mapOf("type" to "string", "minLength" to 3)),
+                                mapOf("path" to listOf("$.vc.credentialSubject.status"), "filter" to mapOf("type" to "string", "const" to "active"))
+                            )
+                        )
+                    )
+                )
+            )
+            call.respond(pd)
+        }
+
+        // 2) Build an authorization request (QR/deeplink payload)
         get("/authorize-presentation") {
-            val requestUri = "openid-vc://?client_id=https://verifier.example.com/callback&scope=openid&response_type=vp_token&presentation_definition_uri=https://verifier.example.com/pd/university-id"
-            call.respond(mapOf("authorization_request_uri" to requestUri))
+            val state = java.util.UUID.randomUUID().toString()
+            val nonce = java.util.UUID.randomUUID().toString()
+            requestStore[state] = nonce
+
+            val req = AuthzReq(
+                client_id = "$base/callback",
+                redirect_uri = "$base/callback",
+                nonce = nonce,
+                state = state,
+                presentation_definition_uri = "$base/pd/university-id"
+            )
+
+            // Wallets vary: some accept an "openid-vc://" deeplink, others a plain JSON they parse from QR
+            val deepLink = "openid-vc://?client_id=${req.client_id}" +
+                    "&response_type=${req.response_type}" +
+                    "&redirect_uri=${req.redirect_uri}" +
+                    "&nonce=${req.nonce}" +
+                    "&state=${req.state}" +
+                    "&presentation_definition_uri=${req.presentation_definition_uri}"
+
+            call.respond(
+                mapOf(
+                    "authorization_request_uri" to deepLink,
+                    "state" to state,
+                    "nonce" to nonce
+                )
+            )
+        }
+
+        // 3) Callback receiving vp_token + presentation_submission
+        get("/callback") {
+            val state = call.request.queryParameters["state"]
+            val vpToken = call.request.queryParameters["vp_token"]
+            val submission = call.request.queryParameters["presentation_submission"] // JSON string
+            if (state == null || vpToken == null) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "missing vp_token or state"))
+                return@get
+            }
+
+            val expectedNonce = requestStore.remove(state)
+            if (expectedNonce == null) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "unknown or replayed state"))
+                return@get
+            }
+
+            // Parse VP as JWT (JWT-based VP)
+            val vpJwt = com.nimbusds.jwt.SignedJWT.parse(vpToken)
+            val vpClaims = vpJwt.jwtClaimsSet
+
+            // ---- Request binding checks ----
+            val nonceInVp = vpClaims.getStringClaim("nonce") ?: vpClaims.getStringClaim("jti") // varies by wallet
+            if (nonceInVp != expectedNonce) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "nonce mismatch"))
+                return@get
+            }
+
+            // aud can be your verifier base/callback; accept if present and matches
+            val audOk = vpClaims.audience?.isEmpty() != false || vpClaims.audience.contains("$base/callback")
+
+            // Extract embedded VC(s) from VP claims (common patterns)
+            // For JWT-VC in a JWT-VP, wallets often put VCs in "vp" or directly in a claim like "verifiableCredential"
+            val vp = vpClaims.getJSONObjectClaim("vp") // may be null
+            val vcList: List<String> = when {
+                vp != null && vp["verifiableCredential"] is List<*> ->
+                    (vp["verifiableCredential"] as List<*>).map { it.toString() }
+                vpClaims.getClaim("verifiableCredential") is List<*> ->
+                    (vpClaims.getClaim("verifiableCredential") as List<*>).map { it.toString() }
+                else -> emptyList()
+            }
+            if (vcList.isEmpty()) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "no credentials in VP"))
+                return@get
+            }
+
+            // Verify each VC (JWT-VC) signature & claims
+            val verifiedCredentials = mutableListOf<Map<String, Any?>>()
+            for (vcJwtStr in vcList) {
+                val vcJwt = com.nimbusds.jwt.SignedJWT.parse(vcJwtStr)
+                val vcClaims = vcJwt.jwtClaimsSet
+
+                // 1) Issuer allowlist (tighten to your trust framework)
+                val iss = vcClaims.issuer
+                if (iss !in issuerAllowlist) {
+                    call.respond(HttpStatusCode.BadRequest, mapOf("error" to "untrusted issuer: $iss"))
+                    return@get
+                }
+
+                // 2) Fetch Issuer JWKS (cache it in prod)
+                val jwksUri = "http://localhost:8080/.well-known/jwks.json"
+
+                val jwks = com.nimbusds.jose.jwk.JWKSet.parse(
+                    java.net.URL(jwksUri).readText()
+                )
+                val kid = vcJwt.header.keyID
+                val jwk = jwks.keys.firstOrNull { it.keyID == kid } ?: jwks.keys.first()
+                val pub = jwk.toRSAKey().toRSAPublicKey()
+                val ok = vcJwt.verify(com.nimbusds.jose.crypto.RSASSAVerifier(pub))
+                if (!ok) {
+                    call.respond(HttpStatusCode.BadRequest, mapOf("error" to "VC signature invalid"))
+                    return@get
+                }
+
+                // 3) Lifetime
+                val now = java.time.Instant.now()
+                if (vcClaims.expirationTime?.toInstant()?.isBefore(now) == true) {
+                    call.respond(HttpStatusCode.BadRequest, mapOf("error" to "VC expired"))
+                    return@get
+                }
+
+                // 4) Type + payload checks (UniversityID + status=active)
+                val vc = vcClaims.getJSONObjectClaim("vc") ?: run {
+                    call.respond(HttpStatusCode.BadRequest, mapOf("error" to "missing vc claim"))
+                    return@get
+                }
+                val types = (vc["type"] as? List<*>)?.map { it.toString() } ?: emptyList()
+                if (!types.containsAll(listOf("VerifiableCredential", "UniversityID"))) {
+                    call.respond(HttpStatusCode.BadRequest, mapOf("error" to "wrong types: $types"))
+                    return@get
+                }
+                val subject = (vc["credentialSubject"] as? Map<*, *>) ?: emptyMap<String, Any>()
+                if (subject["status"]?.toString() != "active") {
+                    call.respond(HttpStatusCode.BadRequest, mapOf("error" to "status not active"))
+                    return@get
+                }
+
+                // 5) (Optional) Status List 2021 check if you include credentialStatus
+                // val cs = vc["credentialStatus"] as? Map<*, *>
+                // fetch cs["statusListCredential"], decode bitstring, test index...
+
+                verifiedCredentials += mapOf(
+                    "issuer" to iss,
+                    "subjectId" to subject["id"],
+                    "types" to types,
+                    "studentId" to subject["studentId"]
+                )
+            }
+
+            call.respond(
+                mapOf(
+                    "valid" to true,
+                    "aud_ok" to audOk,
+                    "state" to state,
+                    "verified" to verifiedCredentials,
+                    "submission" to submission // you can parse & validate against your PD here
+                )
+            )
         }
     }
 }

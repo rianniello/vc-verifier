@@ -8,4 +8,5 @@ build
 .gradle/
 out/
 .kotlintest
+.kotlin
 .idea/workspace.xml
